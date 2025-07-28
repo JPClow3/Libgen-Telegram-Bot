@@ -1,136 +1,128 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+import logging
+import os
+import tempfile
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+# Carregue as variáveis de ambiente de um arquivo .env para desenvolvimento local
+# Em produção (Heroku), defina estas variáveis diretamente nas configurações do app
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from BookInfo import BookInfoProvider
-from common import TELEGRAM_ACCESS_TOKEN, logging, logger, mode, HEROKU_APP_NAME
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackQueryHandler
-import os, sys, wget, glob
-from functools import wraps
-from telegram import ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton
+
+# Habilitar logging
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
 
 
-# Create the EventHandler and pass it your bot's token.
-updater = Updater(token = TELEGRAM_ACCESS_TOKEN, use_context=True)
+# Função para o comando /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envia uma mensagem de boas-vindas quando o comando /start é emitido."""
+    await update.message.reply_html(
+        "Olá! Envie-me o título de um livro e eu tentarei encontrá-lo no Libgen."
+    )
 
-# Get the dispatcher to register handlers
-dp = updater.dispatcher
 
-if mode == "dev":
-    def run(updater):
-        updater.start_polling()
-elif mode == "prod":
-    def run(updater):
-        PORT = int(os.environ.get("PORT", "8443"))
-        # Code from https://github.com/python-telegram-bot/python-telegram-bot/wiki/Webhooks#heroku
-        updater.start_webhook(listen="0.0.0.0",
-                              port=PORT,
-                              url_path=TELEGRAM_ACCESS_TOKEN)
-        updater.bot.set_webhook("https://{}.herokuapp.com/{}".format(HEROKU_APP_NAME, TELEGRAM_ACCESS_TOKEN))
-else:
-    logger.error("No MODE specified!")
-    sys.exit(1)
+# Função para pesquisar livros
+async def search_books(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pesquisa por livros com base no texto do usuário e mostra os resultados."""
+    search_query = update.message.text
+    await update.message.reply_text("Buscando... Por favor, aguarde.")
 
-def button(update, context):
+    try:
+        provider = BookInfoProvider()
+        books = provider.load_book_list(search_query, 'title')
+
+        if not books:
+            await update.message.reply_text("Desculpe, nenhum livro encontrado com esse título. Tente outro.")
+            return
+
+        # Armazena os resultados no contexto do usuário para uso posterior no callback
+        context.user_data['search_results'] = books
+
+        # Formata a lista de livros em uma única mensagem
+        message_text = "Encontrei os seguintes livros:\n\n"
+        keyboard = []
+        for i, book in enumerate(books):
+            message_text += f"{i + 1}. <b>{book.title}</b>\n"
+            message_text += f"   Autor: {book.authors}\n"
+            message_text += f"   Formato: {book.format}, Tamanho: {book.size}\n\n"
+            # Adiciona um botão para cada livro com seu índice como callback_data
+            keyboard.append([InlineKeyboardButton(f"Baixar Livro {i + 1}", callback_data=str(i))])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(message_text, reply_markup=reply_markup, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Ocorreu um erro durante a busca: {e}")
+        await update.message.reply_text("Ocorreu um erro. Por favor, tente novamente mais tarde.")
+
+
+# Função de callback para o botão de download
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Processa o clique no botão de download."""
     query = update.callback_query
-    query_data = int(query.data)
-    print(query_data)
-    provider = BookInfoProvider()
-    books = provider.load_book_list(text, 'title')
+    await query.answer()
+
+    try:
+        book_index = int(query.data)
+        books = context.user_data.get('search_results')
+
+        if not books or book_index >= len(books):
+            await query.edit_message_text(text="Erro: resultados da pesquisa expiraram. Por favor, pesquise novamente.")
+            return
+
+        selected_book = books[book_index]
+        download_link = selected_book.download_links[0]
+
+        await query.edit_message_text(text=f"Baixando '{selected_book.title}'... Isso pode levar um momento.")
+
+        # Baixa o arquivo
+        response = requests.get(download_link, stream=True)
+        response.raise_for_status()  # Gera um erro para respostas ruins (4xx ou 5xx)
+
+        # Usa um arquivo temporário para salvar o livro
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{selected_book.format}") as temp_file:
+            temp_file.write(response.content)
+            temp_path = temp_file.name
+
+        # Envia o arquivo para o usuário
+        with open(temp_path, 'rb') as document:
+            await context.bot.send_document(chat_id=query.message.chat_id, document=document,
+                                            filename=f"{selected_book.title}.{selected_book.format}")
+
+        # Limpa o arquivo temporário
+        os.remove(temp_path)
+
+    except Exception as e:
+        logger.error(f"Falha no download ou envio: {e}")
+        await query.message.reply_text("Desculpe, falha ao baixar o livro.")
 
 
-    dl = books[query_data].download_links[0]
-    if not os.path.exists('book'):
-      os.makedirs('book')
-    wget.download(dl,'book/')
+def main() -> None:
+    """Inicia o bot."""
+    # Pega o token da variável de ambiente
+    TOKEN = os.getenv("TELEGRAM_ACCESS_TOKEN")
+    if not TOKEN:
+        raise ValueError("Nenhum TELEGRAM_ACCESS_TOKEN encontrado nas variáveis de ambiente")
 
-    os.chdir('book')
-    for file in glob.glob("*." + str(books[query_data].format)):
-        filename = file
+    # Cria a Aplicação
+    application = Application.builder().token(TOKEN).build()
 
-    context.bot.send_document(chat_id=update.effective_message.chat_id, document=open(filename, 'rb'),timeout = 120)
-    os.remove(filename)
-    for m in mid:
-        context.bot.delete_message(chat_id=update.effective_message.chat_id, message_id=m.message_id)
+    # Adiciona os handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_books))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
-
-
-def send_action(action):
-    """Sends `action` while processing func command."""
-
-    def decorator(func):
-        @wraps(func)
-        def command_func(update, context, *args, **kwargs):
-            context.bot.send_chat_action(chat_id=update.effective_message.chat_id, action=action)
-            return func(update, context,  *args, **kwargs)
-        return command_func
-    
-    return decorator
+    # Inicia o bot (modo polling)
+    application.run_polling()
 
 
-send_typing_action = send_action(ChatAction.TYPING)
-
-
-# Define a few command handlers. These usually take the two arguments bot and
-# update. Error handlers also receive the raised TelegramError object in error.
-def start(update,context):
-    """Send a message when the command /start is issued."""
-    print('Start')
-    update.message.reply_text('Hi! Type your book title, I will try to find it.')
-
-
-def help(update,context):
-    """Send a message when the command /help is issued."""
-    update.message.reply_text('Help!')
-
-
-@send_typing_action
-def echo(update,context):
-	try:
-		pass
-		provider = BookInfoProvider()
-		books = provider.load_book_list(update.message.text, 'title')
-		global text
-		global mid
-		text = update.message.text 
-		mid = list()
-		keyboard = list()
-		ids = list()
-		for book in books:
-			mid.append(update.message.reply_text(str(book)))
-			ids.append(book.id)
-		if len(ids) != 0:    
-			for each,i in zip(ids,range(len(ids))):
-				keyboard.append(InlineKeyboardButton(each, callback_data = i))
-				reply_markup=InlineKeyboardMarkup(build_menu(keyboard,n_cols=5)) 
-			mid.append(context.bot.send_message(chat_id=update.message.chat_id, text='Choose Book ID',reply_markup=reply_markup))
-		else:
-			update.message.reply_text("Sorry, Book not found! :'(")
-	except:
-		update.message.reply_text("Some Weird Error Occured! RETRY.")
-
-def build_menu(buttons,n_cols,header_buttons=None,footer_buttons=None):
-    menu = [buttons[i:i + n_cols] for i in range(0, len(buttons), n_cols)]
-    if header_buttons:
-        menu.insert(0, header_buttons)
-    if footer_buttons:
-        menu.append(footer_buttons)
-    return menu
-
-def error_callback(update, context):
-    logger.warning('Update "%s" caused error "%s"', update, context.error)
-
-
-def main():
-    # on different commands - answer in Telegram
-    dp.add_handler(CommandHandler("start", start))
-    dp.add_handler(CommandHandler("help", help))
-
-    # on noncommand i.e message - echo the message on Telegram
-    dp.add_handler(MessageHandler(Filters.text, echo))
-
-    dp.add_handler(CallbackQueryHandler(button))
-
-    run(updater)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

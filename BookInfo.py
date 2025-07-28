@@ -1,157 +1,146 @@
-# -*- coding: utf-8 -*-
-
-import re, os,wget
-import urllib.error
-import urllib.parse
-import urllib.request
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import quote, urljoin
 
-from common import LIBGEN_DOMAIN
+# Alterado para importar o novo domínio
+from common import ZLIB_DOMAIN
 
 
 class BookInfo:
-    """Class for storing book information"""
+    """Classe para armazenar informações do livro (sem alterações)."""
 
     def __init__(self, book):
-        self.title = book.get('title', None)
-        self.authors = book.get('authors', None)
-        self.id = book.get('id', None)
-        self.publisher = book.get('publisher', None)
-        self.pages = book.get('pages', None)
-        self.format = book.get('format', None)
-        self.year = book.get('year', None)
-        self.language = book.get('language', None)
-        self.year = book.get('year', None)
-        self.size = book.get('size', None)
-
-        self.download_links = book.get('links', list())
+        self.id = book.get('id')
+        self.title = book.get('title')
+        self.authors = book.get('authors')
+        self.publisher = book.get('publisher')  # Z-lib não fornece isso facilmente na busca
+        self.year = book.get('year')
+        self.pages = book.get('pages')  # Z-lib não fornece isso facilmente na busca
+        self.language = book.get('language')
+        self.size = book.get('size')
+        self.format = book.get('format')
+        self.download_links = book.get('links', [])
 
     def __repr__(self):
-        return 'BookInfo(author: {}, title: {}...)'.format(self.author, self.title[:15])
+        return f'BookInfo(authors: {self.authors}, title: {self.title[:25]}...)'
 
     def __str__(self):
-        text_str = '''\
-Book:
-    Id: {id},
-    Author: {author},
-    Title: {title},
-    Pages: {pages},
-    Format: {format},
-    Size: {size},\
-    '''.format(id=self.id,
-               author=self.authors,
-               title=self.title,
-               pages=self.pages,
-               format=self.format,
-               size=self.size)
-
-        return text_str
+        return (
+            f"<b>Título:</b> {self.title}\n"
+            f"<b>Autor(es):</b> {self.authors}\n"
+            f"<b>Ano:</b> {self.year}\n"
+            f"<b>Idioma:</b> {self.language}\n"
+            f"<b>Formato:</b> {self.format}\n"
+            f"<b>Tamanho:</b> {self.size}"
+        )
 
 
 class BookInfoProvider:
-    """Class which loads book information"""
-    URL = LIBGEN_DOMAIN + 'search.php?req={}&open=0&view=simple&phrase=1&column={}'
+    """Classe reescrita para carregar informações de livros do Z-Library."""
+    BASE_URL = ZLIB_DOMAIN
+    # A URL de busca do Z-Library é mais simples
+    SEARCH_URL = BASE_URL + '/s/{query}'
 
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        })
 
-    def load_book_list(self, search_query, search_type):
-        """Loads books with search_query and search_type. Returns list()"""
-        search_query = search_query.strip().replace(" ", "+")
-        search_query = urllib.parse.quote(search_query)
+    def load_book_list(self, search_query, search_type=''):  # search_type não é mais usado
+        """Carrega uma lista de livros do Z-Library."""
+        search_query_encoded = quote(search_query.strip())
+        url = self.SEARCH_URL.format(query=search_query_encoded)
 
-        request = urllib.request.Request(self.URL.format(search_query, search_type))
-        response = urllib.request.urlopen(request)
+        try:
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            print(f"Erro ao acessar a URL de busca do Z-Library: {e}")
+            return []
 
-        soup = BeautifulSoup(response, 'html.parser')
-        table = soup.find('table', attrs={'class': 'c'})
-        table_rows = table.findAll('tr', recursive=False)[1:]
-        book_list = list()
-        for row in table_rows[:10]:
-            book_list.append(BookInfo(self.__extract_book(row)))
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # Os livros estão em contêineres com a classe 'book-item-wrapper'
+        book_items = soup.find_all('div', class_='book-item-wrapper', limit=10)
+
+        if not book_items:
+            return []
+
+        book_list = []
+        for item in book_items:
+            try:
+                book_data = self.__extract_book(item)
+                if book_data and book_data.get('links'):
+                    book_list.append(BookInfo(book_data))
+            except Exception as e:
+                print(f"Erro ao extrair dados do livro: {e}")
+                continue
 
         return book_list
 
-    def __extract_book(self, table_row):
-        """Extract book information from piece of html page. Returns dictionary"""
-        book = dict()
+    def __extract_book(self, item):
+        """Extrai informações de um item de livro da página de resultados."""
+        # Encontra o link para a página do livro e o título
+        title_tag = item.find('h3', class_='book-title').find('a')
+        if not title_tag:
+            return None
 
-        domains = table_row.find_all('td')
-        it = iter(domains)
+        book_page_relative_url = title_tag['href']
+        # Constrói a URL absoluta para a página do livro
+        book_page_url = urljoin(self.BASE_URL, book_page_relative_url)
 
-        try:
-            book['id'] = next(it).contents[0]
-            book['authors'] = ''.join([i.text for i in next(it).find_all('a', href=re.compile("author"))])
+        # Extrai os autores
+        authors = ', '.join([a.text for a in item.find_all('div', class_='authors')])
 
-            # extract some info from Title domain (possible more)
-            title_domain = next(it)
-            series = title_domain.find('a', href=re.compile("series"))
-            book['series'] = series.text if series is not None else None
-            book['title'] = title_domain.find('a', href=re.compile("book")).contents[0]
+        # Extrai detalhes como ano, idioma, formato e tamanho
+        year_div = item.find('div', class_='property_year')
+        year = year_div.find('div', class_='property_value').text.strip() if year_div else 'N/A'
 
-            # Just text fields
-            book['publisher'] = next(it).text
-            book['year'] = next(it).text
-            book['pages'] = next(it).text
-            book['language'] = next(it).text
-            book['size'] = next(it).text
-            book['format'] = next(it).text
+        lang_div = item.find('div', class_='property_language')
+        language = lang_div.find('div', class_='property_value').text.strip() if lang_div else 'N/A'
 
+        file_info_div = item.find('div', class_='property_file')
+        file_info_text = file_info_div.find('div',
+                                            class_='property_value').text.strip() if file_info_div else 'N/A, N/A'
 
-            filename = book['title']
-            ext = book['format']
-            
-            # Get download links
-            links = list()
-            next(it)
-            for link in next(it).find_all('a'):
-                download_link = self.__get_download_link(link['href'])
-                if download_link is not None:
-                    links.append(download_link)
-            filename = book['title']
-            ext = book['format']
+        file_format, file_size = [x.strip() for x in file_info_text.split(',')]
 
-            # Just text fields)
+        book = {
+            'id': book_page_relative_url.split('/')[2],  # Usa parte da URL como ID
+            'title': title_tag.text.strip(),
+            'authors': authors,
+            'year': year,
+            'language': language,
+            'format': file_format,
+            'size': file_size,
+            'publisher': 'N/A',  # Não disponível na página de busca
+            'pages': 'N/A',  # Não disponível na página de busca
+            'links': []
+        }
 
-            book['links'] = links
-            # dl = book['links'][0]
-            # print(dl)
-            # print('Download')
-            # path = filename
-            # if not os.path.exists('book'):
-            #     os.makedirs('book')
+        # Agora, visita a página do livro para obter o link de download final
+        final_download_link = self.__get_final_download_link(book_page_url)
+        if final_download_link:
+            book['links'].append(final_download_link)
 
-            # #wget.download(dl,'book/' + path)
-            # header = {'User-Agent': 'Aditya7069 Telegram Bot'}
-            # r = requests.get(url = dl, headers = header)
-            # with open('book/' + path.strip('/') + book['id'], 'wb') as f:
-            #     f.write(r.content)
-            #     f.close()
-            # print("Done")
-
-
-        except Exception as e:
-            print('Got error:', e)
-            raise (e)
         return book
 
-    def __get_download_link(self, book_link):
-        download_link = None
-        request = urllib.request.Request(book_link)
+    def __get_final_download_link(self, book_page_url):
+        """Navega até a página do livro para obter o link de download final."""
         try:
-            response = urllib.request.urlopen(request)
-            soup = BeautifulSoup(response, 'html.parser')
+            response = self.session.get(book_page_url, timeout=10)
+            response.raise_for_status()
 
-            long_link = soup.find_all('a', href=True, text='GET')[0]['href']
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # O link de download está em um botão com a classe 'btn-dl'
+            download_button = soup.find('a', class_='btn-dl')
 
-        except urllib.error.HTTPError as e:
-            # Return code error (e.g. 404, 501, ...)
-            # ...
-            print('HTTPError: ', e.code)
-        except urllib.error.URLError as e:
-            # Not an HTTP-specific error (e.g. connection refused)
-            # ...
-            print('URLError: ', e.reason)
-        except Exception as e:
-            # this another shit
-            print('Some Another error:', e)
-        return long_link
+            if download_button and download_button.has_attr('href'):
+                relative_link = download_button['href']
+                # Constrói a URL de download absoluta
+                return urljoin(self.BASE_URL, relative_link)
+
+        except requests.RequestException as e:
+            print(f"Erro ao acessar a página do livro {book_page_url}: {e}")
+
+        return None
